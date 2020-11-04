@@ -61,7 +61,7 @@ x1 <- sample(1:100, sample_size, replace=TRUE) + rnorm(mean=0, sd=1, n=sample_si
 x2 <- sample(1:100, sample_size, replace=TRUE) + rnorm(mean=0, sd=1, n=sample_size)
 
 # Creating the relationship between X1, X2 and Y
-variation <- rnorm(mean=0, sd=6, n=sample_size)
+variation <- rnorm(mean=0, sd=24, n=sample_size)
 y_true <- 2*x1 - 0.01*x1*x1 + 0.5 + x2 + variation
 
 indices_method <- sample(1:sample_size, floor(sample_size/4), replace=FALSE)    # Drawing a portion of the observations
