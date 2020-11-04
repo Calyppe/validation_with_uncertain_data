@@ -65,8 +65,8 @@ variation <- rnorm(mean=0, sd=24, n=sample_size)
 y_true <- 2*x1 - 0.01*x1*x1 + 0.5 + x2 + variation
 
 indices_method <- sample(1:sample_size, floor(sample_size/4), replace=FALSE)    # Drawing a portion of the observations
-var_e1 <- 5
-var_e2 <- 16
+var_e1 <- 16
+var_e2 <- 36
 var_e <- rep(0, sample_size)
 var_e[indices_method] <- var_e1                                                 # Giving the subsample measurement error variance 1
 var_e[-indices_method] <- var_e2                                                # Giving the rest of the observations measurement error variance 2
