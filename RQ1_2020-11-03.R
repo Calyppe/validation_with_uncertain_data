@@ -2,7 +2,7 @@
 # DSM with uncertain data
 # RQ 1: Validation metrics
 # Author: Chloe Girka
-# Date: 2020-11-03          Increase epsilon and measurement errors
+# Date: 2020-11-04
 
 
 #############################
@@ -105,7 +105,7 @@ train_ind <- sample(1:nrow(udf),0.8*nrow(udf))
 train_data <- udf[train_ind,]
 
 # Fitting
-lm.fit <- lm(y_obs~x1+I(x1^2)+x2, data=train_data)
+lm.fit <- lm(y_true~x1+I(x1^2)+x2, data=train_data)
 
 # Prediction
 udf$y_sim <- predict(lm.fit, udf)
