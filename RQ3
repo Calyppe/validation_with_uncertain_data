@@ -1,0 +1,219 @@
+
+
+#############################################################
+###############     Research question 3     #################
+#############################################################
+
+# Parallel processing
+library(foreach)
+library(doParallel)
+
+#set simulation parameters
+#number of repeats
+D <- 100
+#the synthetic standard deviation
+synt_err_sd <- 1 * d$clay_sd
+#the number of folds for cross-validation
+k <- 5
+
+#set proportion of data used
+data_used <- c(1, 0.75, 0.50)
+#set proportion of data with enhanced error
+enh_data_used <- c(1, 0.75, 0.50, 0.25, 0)
+
+prmtrs <- expand.grid(data_used,enh_data_used)
+names(prmtrs) <- c("data_used","err_amplified")
+
+rep_df<-function(df,n){
+  df[rep(seq_len(nrow(df)), each=n),]
+}
+prmtrs_l <- rep_df(prmtrs,D)
+dim(prmtrs_l)
+
+# generate synthetic error and add to clay data
+
+set.seed(321)
+
+d3 <- d 
+synt_error <- rnorm(mean=0, sd=synt_err_sd, n=nrow(d3)) 
+d3$clay_synt <- d3$clay + synt_error
+d3$clay_synt[d3$clay_synt < 0] <- 0
+d3$clay_synt[d3$clay_synt > 100] <- 100
+d3$clay_sd_synt <- d3$clay_sd + synt_err_sd
+
+set.seed(156)
+
+#rq3_names <- c("iteration","err_amplified", "data_used", "ME", "RMSE", "MEC", "CCC", "PICP")
+#rq3_res_RF <- data.frame(matrix(ncol = 8, nrow = 0))
+#names(rq3_res_RF) <- rq3_names
+#rq3_res_FRF <- data.frame(matrix(ncol = 8, nrow = 0))
+#names(rq3_res_FRF) <- rq3_names
+
+ #i_row <- 1 
+
+
+#####################run parallel code
+#Setup the parallel computing parameters
+nr_cors <- detectCores()
+#use only the number of cores minus one
+cl <- makeCluster(nr_cors-1,outfile=paste0(getwd(),"/R_par_logs.txt"))
+registerDoParallel(cl)
+
+loop_time2 <- Sys.time()
+# Parallel Loop
+results <- foreach(l=1:nrow(prmtrs_l),
+                   .combine=rbind,
+                   .errorhandling="pass",
+                   .verbose=T)             %dopar% {
+                     
+                     #packages must be loaded within the parallel computing loop
+                     library(sf)
+                     library(gstat)
+                     library(rgdal)
+                     library(raster)
+                     library(rgeos)
+                     library(automap)
+                     library(plyr)
+                     library(reshape)
+                     library(dplyr)
+                     library(randomForest)
+                     library(quantregRanger)
+                     library(DescTools)
+                     library(MASS)
+                     library(ranger)
+                     library(DEoptim)
+                     
+                     #set parameters for the j-th parallelization 
+                     set_prmts <- prmtrs_l[l,]
+
+                     data_used <- set_prmts[,"data_used"]
+                     err_amplified <- set_prmts[,"err_amplified"]
+
+  
+  #Created cv-indices for data set
+  #set.seed(seed)
+  d3 <- d3[sample(1:nrow(d3)),]
+  d3$fold <- cut(seq(1,nrow(d3)),breaks=k,labels=FALSE)
+  d3 <- d3[order(as.numeric(row.names(d3))),]
+  
+  
+  ma_cv_RF <- matrix(0, nrow=k, ncol=4)
+  ma_cv_FRF <- matrix(0, nrow=k, ncol=4)
+  
+  PICP_RF <- rep(0, k)
+  PICP_FRF <- rep(0, k)
+  
+  #folds <- rep(1:k, ceiling(nrow(d3)/k))
+  #folds <- sample(folds, length(folds))
+  #folds <- folds[1:nrow(d3)]
+  #d3$fold <- folds
+  #for (a in c(1, 0.75, 0.50)) {             # Proportion of data used
+   # for (b in c(1, 0.75, 0.50, 0.25, 0)){   # Proportion of data with enhanced error
+      for (j in 1:k) {
+        # Separate training and testing data set
+        trn <- d3[d3$fold!=j,]
+        trn <- trn[sample(nrow(trn), size=floor(data_used*nrow(trn))),]  # Reducing the size of the training set
+        trn <- trn[order(as.numeric(row.names(trn))),]
+        te <- d3[d3$fold==j,]
+        # Increase error in clay measurements in the training set
+        enhanced <- sample(nrow(trn), size=floor(err_amplified*nrow(trn)))
+        trn$clay[enhanced] <- trn$clay_synt
+        trn$clay_sd[enhanced] <- trn$clay_sd_synt
+        trn <- trn[order(as.numeric(row.names(trn))),]
+        #RF model
+        rf_fit_cv <- ranger(formula=fn,trn,mtry=ms_rfNoME_f)
+        rf_pred_cv <- predict(rf_fit_cv, te)$prediction
+        rf_pred_cv <- as.matrix(rf_pred_cv, ncol=1)
+        
+        rf_fit_cv <-  quantregRanger(formula=fn,trn,params.ranger=list(mtry=ms_rfNoME_f))
+        ma_RF_cv <- val_stats_chloe(te$clay,rf_pred_cv,te$clay_sd^2)
+        ma_cv_RF[j,] <- c(ma_RF_cv$ME,ma_RF_cv$RMSE,ma_RF_cv$MEC,ma_RF_cv$CCC)
+        
+        # FRF
+        frf_fit_cv <- ranger(formula=fn,trn,mtry=ms_rfME_f)
+        
+        resvar <- lm(abs(trn$clay-frf_fit_cv$predictions)~frf_fit_cv$predictions)$fitted.values^2
+        resvar_ML <- optim(par=resvar,fn=loglik_resvar,
+                           e=(trn$clay-frf_fit_cv$predictions),V=trn$clay_sd^2)
+        resvar_est <- resvar_ML$par
+        wts <- 1/(resvar_est+(trn$clay_sd^2))
+        frf_fit_cv <- ranger(formula=fn,trn,case.weights=wts,mtry=ms_rfME_f)
+        frf_pred_cv <- predict(frf_fit_cv, te)$prediction
+        frf_pred_cv <- as.matrix(frf_pred_cv, ncol=1)
+        frf_fit_cv <- quantregRanger(formula=fn,trn,params.ranger=list(case.weights=wts,mtry=ms_rfME_f))
+        
+        ma_FRF_cv <- val_stats_chloe(te$clay,frf_pred_cv,te$clay_sd^2)
+        ma_cv_FRF[j,] <- c(ma_FRF_cv$ME, ma_FRF_cv$RMSE, ma_FRF_cv$MEC, ma_FRF_cv$CCC)
+        
+        #PICP
+        pred_interval_RF <- predict(rf_fit_cv,te, quantiles= c(0.05,0.95))
+        pred_interval_FRF <- predict(frf_fit_cv, te,quantiles= c(0.05,0.95))
+        error_sd_rf <- rep(0,nrow(te))
+        error_sd_frf <- rep(0,nrow(te))
+        for (m in 1:nrow(te)) {
+          error_sd_rf[m] <- (max(pred_interval_RF[m,])-min(pred_interval_RF[m,]))/(2*1.645)
+          error_sd_frf[m] <- (max(pred_interval_FRF[m,])-min(pred_interval_FRF[m,]))/(2*1.645)
+        }
+        mini_rf <- rf_pred_cv - 1.645*sqrt(error_sd_rf^2 + te$clay_sd^2)
+        maxi_rf <- rf_pred_cv + 1.645*sqrt(error_sd_rf^2 + te$clay_sd^2)
+        adjusted_interval_rf <- data.frame(mini_rf, maxi_rf)
+        PICP_RF[j] <- EstimatePICP(adjusted_interval_rf, te$clay)
+        
+        mini_frf <- frf_pred_cv - 1.645*sqrt(error_sd_frf^2 + te$clay_sd^2)
+        maxi_frf <- frf_pred_cv + 1.645*sqrt(error_sd_frf^2 + te$clay_sd^2)
+        adjusted_interval_frf <- data.frame(mini_frf, maxi_frf)
+        PICP_FRF[j] <- EstimatePICP(adjusted_interval_frf, te$clay)
+        
+      }
+      rq3_res_RF <- c(mean(ma_cv_RF[,2]),mean(ma_cv_RF[,3]),mean(ma_cv_RF[,4]), mean(PICP_RF))
+      rq3_res_FRF <- c(mean(ma_cv_FRF[,2]),mean(ma_cv_FRF[,3]),mean(ma_cv_FRF[,4]), mean(PICP_FRF))
+      
+      results <- c(data_used,err_amplified,rq3_res_RF,rq3_res_FRF)
+      rbind(results)
+      
+      #i_row <- i_row + 1
+   # }}
+}
+
+stopCluster(cl)
+loop_time2 <- Sys.time() - loop_time2
+#####################run parallel code - END
+
+
+
+RF_results <- data.frame(results[,1:6])
+FRF_results <- data.frame(results[,c(1:2,7:10)])
+
+results_names <- c("data_used","err_amplified","RMSE","MEC","CCC","PICP")
+
+colnames(RF_results) <- results_names
+rownames(RF_results) <- 1:nrow(prmtrs_l)
+
+colnames(FRF_results) <- results_names
+rownames(FRF_results) <- 1:nrow(prmtrs_l)
+
+
+final_res_RF <-aggregate(RF_results[,-c(1:2)],by=list(RF_results[,1],RF_results[,2]),mean)
+final_res_FRF <-aggregate(FRF_results[,-c(1:2)],by=list(FRF_results[,1],FRF_results[,2]),mean)
+
+names(final_res_RF) <- c("percent_data_used","percent_error_enhanced", "RMSE", "MEC", "CCC", "PICP")
+names(final_res_FRF) <- c("percent_data_used","percent_error_enhanced", "RMSE", "MEC", "CCC", "PICP")
+
+
+###############################
+#####  Creating box plot  #####
+###############################
+
+RF_results_100 <- RF_results[RF_results$data_used == 1.00,]
+RF_results_100$model <- "RF"
+FRF_results_100 <- FRF_results[RF_results$data_used == 1.00,]
+FRF_results_100$model <- "FRF"
+
+results_100 <- rbind(RF_results_100, FRF_results_100)
+results_100$MSE <- results_100$RMSE^2
+
+boxplot(MSE~data_used*model*err_amplified, data=results_100,
+        col=c("gold","orange"), names=c("FRF\n0%","RF\n0%","FRF\n25%","RF\n25%","FRF\n50%","RF\n50%","FRF\n75%","RF\n75%","FRF\n100%","RF\n100%"),
+        xlab="Proportion of uncertainty-enhanced data", ylab="MSE")
+
+# ---END---#
