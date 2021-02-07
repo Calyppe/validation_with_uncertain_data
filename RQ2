@@ -1,0 +1,1319 @@
+
+##Namibia - ME Article
+
+#Stephan van der Westhuizen
+
+#Adapted from ->
+##### Version 1.0, 21-06-2016                                                                                              ######
+##### D. Brus, B. Kempen, G. Heuvelink   
+
+
+
+# Content:
+#
+# (A) Load necessary packages
+# (B) Prepare data
+#     (i)  Spatial data settings / clean data
+#     (ii) Do a quick analysis to explore the Namibia data
+# (C) Load model functions
+# (D) Do for loop to perform model selection and assessment
+#     (i) Perform CV for model selection
+#     (ii) Perform CV for model assessment
+# (E) Fit models on full sample and predict the Nam grid
+
+############################################################
+#              (A) Load packages
+############################################################
+
+library(sf)
+library(GSIF)
+library(rgdal)
+library(plyr)
+library(foreign)
+library(stringr)
+library(maptools)
+library(raster)
+library(gstat)
+#library(variography)
+library(automap)
+
+library(ranger)
+library(leaps)
+library(quantregRanger)
+
+library(tmap)
+library(ggplot2)
+
+library(DescTools)
+library(slam)       #for rollup
+library(xtable)     #for exporting latex tables
+library(DEoptim)
+
+library(leaflet)
+
+############################################################
+#              (B) Prepare data
+############################################################
+
+###############################################
+#     (i) Spatial data settings / clean data
+###############################################
+
+
+#Set map projections
+aeqd <- "+proj=aeqd +lat_0=8.5 +lon_0=21.5 +x_0=5621452.01998 +y_0=5990638.42298 +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0"
+wgs84 <-"+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+
+#Load data
+covars <- st_read(paste0(getwd(),"/Data/samples.covars.shp"))
+grid_covs <- st_read(paste0(getwd(),"/Data/grid.covars.shp"))
+layers <- st_read(paste0(getwd(),"/Data/samples.layers.shp"))
+study_area <- readShapePoly(fn=paste0(getwd(),"/Data/study_area.shp"))
+country <- st_read(paste0(getwd(),"/Data/study_area.shp"))
+
+#Get clay data and combine with covariates
+data <- as.data.frame(layers)
+datacovs <- as.data.frame(covars)
+#Extract names for covariates
+covs_names <- colnames(datacovs)[2:161]
+
+data[data[,"source"]=="afsp","clay_sd"] <- ifelse(data[data[,"source"]=="afsp","reliab"]==1,2/1.34,
+                                                  ifelse(data[data[,"source"]=="afsp","reliab"]==2,4/1.34,
+                                                         8/1.34))
+
+
+layers[layers$source=="afsp",]$clay_sd <- data[data[,"source"]=="afsp","clay_sd"]
+
+
+#######################################
+#NEW code for clay_sd (0-20)
+#######################################
+
+#calculate clay_sd (0-20) for LPKS
+
+LPKS <-data[data[,"source"]=="LPKS",]
+rownames(LPKS) <- 1:nrow(LPKS)
+
+s_LPKS <- LPKS
+coordinates(s_LPKS) <- ~x+y
+LPKS$un_id <- zerodist(s_LPKS,unique.ID = T)
+
+#only one layer in LPKS
+t1 <- LPKS[LPKS[,"un_id"] %in% as.numeric(names(which(table(LPKS$un_id)==1))),]
+# two layers in LPKS
+t2 <- LPKS[LPKS[,"un_id"] %in% as.numeric(names(which(table(LPKS$un_id)==2))),]
+# all three layers in LPKS
+t3 <- LPKS[LPKS[,"un_id"] %in% as.numeric(names(which(table(LPKS$un_id)==3))),]
+
+
+mat <- matrix(0,nrow=length(unique(t3$un_id)),ncol=3)
+sd_calc <- function(x){if(x[1]==1){(.05*x[2])^2} else if(x[1]==10){(.45*x[2])^2} else if(x[1]==20){(.5*x[2])^2}}
+m_calc <- function(x){if(x[1]==1){(.05*x[2])} else if(x[1]==10){(.45*x[2])} else if(x[1]==20){(.5*x[2])}}
+
+#roll up clay and clay_sd data in t3
+for(i in 1:length(unique(t3$un_id))){
+  mat[i,1] <- unique(t3$un_id)[i]
+  temp <- t3[t3$un_id==unique(t3$un_id)[i],][,c("bottom","clay","clay_sd")]
+  matj <- matrix(0,nrow=length(temp[,1]),ncol=2)
+  for(j in 1:length(temp[,1])){
+    matj[j,1] <- as.numeric(m_calc(temp[j,1:2]))
+    matj[j,2] <- as.numeric(sd_calc(temp[j,c(1,3)]))
+  }
+  mat[i,2] <- sum(matj[,1])
+  mat[i,3] <- sqrt(sum(matj[,2]))
+}
+
+new_clay <- data.frame(un_id=mat[,1],clay=mat[,2],clay_sd=mat[,3])
+
+#merge with the rest of LPKS (to obtain coordinates and other variables)
+LPKS_new <- merge(subset(LPKS,select=-c(clay,clay_sd)),new_clay,by="un_id")
+
+#remove duplicates, in this way only the t3 part of LPKS with the rolled up values remain
+s_LPKS_new <- subset(LPKS_new,select=-c(un_id))
+coordinates(s_LPKS_new) <- ~x+y
+s_LPKS_new <- remove.duplicates(s_LPKS_new)
+
+data2 <- rbind(data[data[,"source"]=="afsp",],as.data.frame(s_LPKS_new))
+
+
+#merge data sets, and remove reliabilty and the geometry columns
+dat <- join(data2[,-c(7,10)],datacovs[,-162],by="profId",type="left",match="first")
+
+#######################################
+#NEW code for clay_sd (0-20) - END
+#######################################
+
+
+
+# set negative value (-32768) for EVI to NA (points are located in water bodies)
+for(i in 1:length(names(dat[,grepl("MOD5", names(dat), perl=TRUE)]))){
+  att <- names(dat[,grepl("MOD5", names(dat), perl=TRUE)])[i]
+  dat[,att] <- ifelse(dat[,att]<0, NA, dat[,att])
+}
+
+# remove irrelant covariates
+dat <- subset(dat,select=-c(C05GLC5,C06GLC5,C08GLC5,F01USG5,F04USG5,L11USG5,LMK))
+
+# remove data points with missing covariates
+dat <- na.omit(dat)
+#Export dat
+#write.table(dat,file=paste0(getwd(),"/Nam_dat.txt"),sep=",",row.names=F,quote=F)
+
+# define target soil property
+Z <- "clay"
+# define uncertainty attribute, if any. should be defined as the standard deviation
+Z_unc <- "clay_sd"
+
+#define uncertainty vector; expressed as the measurment error variance
+if(exists("Z_unc")){
+  V <- dat[,Z_unc]^2 
+} else {
+  V <- 0
+}
+
+
+#create data set that contains only the coordinates, the response, uncertainty and the covariates
+d <- dat[,c(2,3,6:8,9:161)]
+
+#write data as spatial objects and transform the CRS
+s_d <- d
+coordinates(s_d) <- ~x+y
+proj4string(s_d) <- CRS(wgs84)
+s_d <- spTransform(s_d, CRS(aeqd))
+
+#define vector of full list of covariate names
+covs <- names(d[,6:158])
+#remove covariates with no or limited variability
+remove_covs <- which(apply(d[,covs],2,function(x){(max(x)-min(x))==sort(unique(x),decreasing=T)[1]|length(unique(x))<=5})==T)
+covs <- covs[-c(remove_covs)]
+
+
+
+##############################################################
+#    (ii) Do a quick analysis to explore the Namibia data
+##############################################################
+
+# Chloe can skip this for now
+
+# do a quick investigation on the data (specific for clay and clay_sd)
+
+#clay
+summary(d[,3])
+sd(d[,3])
+
+#measurement error variance = clay_sd^2
+summary(d[,5]^2)
+sd(d[,5]^2)
+sd(d[,5]^2)/mean(d[,5]^2) #low variability
+
+cor(d$clay,d$clay_sd^2) # there are some correlation between the observed samples and the measurement error variances, but does not seem significant
+cor(log(d$clay),log(d$clay_sd^2))
+plot(d$clay,d$clay_sd^2)
+plot(log(d$clay),log(d$clay_sd^2))
+
+d2 <- d[d$clay_sd<=10,]
+cor(d2$clay,d2$clay_sd^2) 
+cor(log(d2$clay),log(d2$clay_sd^2))
+plot(d2$clay,d2$clay_sd^2)
+plot(log(d2$clay),log(d2$clay_sd^2))
+
+plot(d[d$source=="afsp",][,"clay"],d[d$source=="afsp",][,"clay_sd"])
+cor(d[d$source=="afsp",][,"clay"],d[d$source=="afsp",][,"clay_sd"])
+
+plot(d[d$source=="LPKS",][,"clay"],d[d$source=="LPKS",][,"clay_sd"])
+cor(d[d$source=="LPKS",][,"clay"],d[d$source=="LPKS",][,"clay_sd"])
+
+summary(d[d$source=="LPKS",][,"clay"])
+summary(d[d$source=="LPKS",][,"clay_sd"])
+
+#construct the variogram to investigate the spatial distribution
+v <- variogram(clay~1,s_d)
+plot(v)
+v_var <- variogram((clay_sd^2)~1,s_d)
+plot(v_var) #no real spatial autocorrelation for the measurement error variances - this is good
+
+#for landPKS
+v_lpks <- variogram(clay~1,s_d[s_d$source=="LPKS",])
+plot(v_lpks)
+v_var_lpks <- variogram((clay_sd^2)~1,s_d[s_d$source=="LPKS",])
+plot(v_var_lpks) #no real spatial autocorrelation for the measurement error variances - this is good
+
+#for afsp
+v_afsp <- variogram(clay~1,s_d[s_d$source=="afsp",])
+plot(v_afsp)
+v_var_afsp <- variogram((clay_sd^2)~1,s_d[s_d$source=="afsp",])
+plot(v_var_afsp) #no real spatial autocorrelation for the measurement error variances - this is good
+
+#fit variogram model for clay to get an estimate (and just a general idea) of the nugget and the psill
+v_fit <- autofitVariogram(clay~1,model="Sph",s_d)
+
+v_fit$var_model[1,2] #nugget
+v_fit$var_model[2,2] #partial sill
+
+v_fit$var_model[1,2] + v_fit$var_model[2,2]  #sill
+
+#ratio of measurement error variance mean to the sill (see Christensen 2011)
+#this value can be used to compare within where we are in the simulation results
+# so that we can expect what the results would be for the filtered models
+mean(d[,5]^2)/(v_fit$var_model[1,2] + v_fit$var_model[2,2])
+
+mean(d[,5]^2)/(v_fit$var_model[1,2] + v_fit$var_model[2,2]-mean(d[,5]^2))
+
+
+#these values are very low and provide us with the expectation that the filtered models will not perform well
+
+
+
+############################################################
+#              (C) Load functions 
+############################################################
+
+#load the model functions and validation functions
+#RK,FRK
+########################################
+
+RK <- function(train,test,Xnames){
+  
+  fn <- as.formula(paste(Z,"~",paste(Xnames,collapse="+")))
+  
+  z <- train[,Z]
+  D <- as.matrix(dist(train[,c(1,2)]))
+  
+  # obtain design matrix and observation vector
+  olsmodel <- lm(fn,data=train)
+  X <- model.matrix(olsmodel)
+  
+  # define likelihood function
+  neglogLikelihood <-
+    function(theta) {
+      c0 <- theta[1]
+      c <- theta[2]
+      r <- theta[3]
+      vgm <- vgm(c,"Sph",r,c0)
+      C <- variogramLine(vgm, dist_vector = D, covariance = TRUE)
+      C_inv <- chol2inv(chol(C))
+      XC <- crossprod(X, C_inv)
+      XCX <- XC %*% X
+      XCX_inv <- chol2inv(chol(XCX))
+      I <- diag(nrow(D))
+      Q <- X %*% XCX_inv %*% XC 
+      logDetC <- determinant(x = C, logarithm = TRUE)$modulus
+      logDetXCX <- determinant(x = XCX, logarithm = TRUE)$modulus
+      L <- I - X%*%chol2inv(chol(crossprod(X,X)))%*%t(X) ### projection matrix as defined in Webster and Oliver, page 201, equation 9.17
+      z2 <- L%*%z # transform data
+      logLikelihood <- -0.5*logDetC-0.5*logDetXCX-0.5*crossprod(z2,C_inv)%*%(I - Q)%*%z
+      neglogLikelihood <- -1*logLikelihood
+      return(neglogLikelihood)
+    }
+  
+  # run optimization
+  lbound <- c(c0 = 0, c = 0, r = 0)
+  ubound <- c(c0 = 85, c = 85, r = 50000)
+  optPars <- DEoptim(
+    fn = neglogLikelihood,
+    lower = lbound,
+    upper = ubound,
+    control = DEoptim.control(strategy =2, bs=F, NP=30, itermax=10, CR=0.5, F=0.8, trace=T)
+  )
+  
+  # store results
+  result<-optPars$optim$bestmem
+  c0 <- result[1]
+  c <- result[2]
+  r <- result[3]
+  
+  z_var_fit <- vgm(c,"Sph",r,c0)
+  #cvm <- as(vgm,"CovariogramStructure")
+  #C <- as(cvm, "function")(D)
+  
+  C <- variogramLine(z_var_fit,
+                     dist_vector=D,covariance=T)
+  
+  
+  # compute GLS coefficients
+  C_inv <- chol2inv(chol(C))
+  XC <- crossprod(X,C_inv)
+  XCX <- XC%*%X
+  XCX_inv <- chol2inv(chol(XCX))
+  y <- train[,Z]
+  Cy <- crossprod(y, C_inv)
+  XCy<-crossprod(X,t(Cy))
+  beta_GLS<-XCX_inv%*%XCy
+  
+  
+  residuals<-y-X%*%beta_GLS
+  
+  pred <- matrix(0,nrow=nrow(test),ncol=1)
+  predvar <- matrix(0,nrow=nrow(test),ncol=1)
+  
+  for (i in 1:nrow(test)) {
+    h0<-sqrt((train$x-test$x[i])^2+(train$y-test$y[i])^2)
+    c0df<-variogramLine(z_var_fit,
+                        dist_vector=h0,covariance=TRUE)
+    C0 <- c0df$gamma
+    x0 <- as.vector(c(1,as.matrix(test[i,Xnames])))
+    muhat <- x0 %*%(beta_GLS)
+    CC0 <- solve(C,C0)
+    pred[i,]<- as.numeric(muhat+crossprod(CC0,as.vector(residuals)))
+    a <- x0 - crossprod(X,CC0)
+    predvar[i,] <- as.numeric(c0+c-crossprod(C0,CC0)
+                              +crossprod(a,solve(XCX,a)))
+  }
+  
+  list(pred=pred,predvar=predvar)
+  
+}
+FRK <- function(train,test,Xnames,V){
+  
+  fn <- as.formula(paste(Z,"~",paste(Xnames,collapse="+")))
+  
+  z <- train[,Z]
+  D <- as.matrix(dist(train[,c(1,2)]))
+  
+  # obtain design matrix and observation vector
+  olsmodel <- lm(fn,data=train)
+  X <- model.matrix(olsmodel)
+  
+  # define likelihood function
+  neglogLikelihood <-
+    function(theta) {
+      c0 <- theta[1]
+      c <- theta[2]
+      r <- theta[3]
+      vgm <- vgm(c,"Sph",r,c0)
+      C <- variogramLine(vgm, dist_vector = D, covariance = TRUE)
+      diag(C) <- diag(C) + V # add measurement error variance to diagonal of covariance matrix C
+      C_inv <- chol2inv(chol(C))
+      XC <- crossprod(X, C_inv)
+      XCX <- XC %*% X
+      XCX_inv <- chol2inv(chol(XCX))
+      I <- diag(nrow(D))
+      Q <- X %*% XCX_inv %*% XC 
+      logDetC <- determinant(x = C, logarithm = TRUE)$modulus
+      logDetXCX <- determinant(x = XCX, logarithm = TRUE)$modulus
+      L <- I - X%*%chol2inv(chol(crossprod(X,X)))%*%t(X) ### projection matrix as defined in Webster and Oliver, page 201, equation 9.17
+      z2 <- L%*%z # transform data
+      logLikelihood <- -0.5*logDetC-0.5*logDetXCX-0.5*crossprod(z2,C_inv)%*%(I - Q)%*%z
+      neglogLikelihood <- -1*logLikelihood
+      return(neglogLikelihood)
+    }
+  
+  # run optimization
+  lbound <- c(c0 = 0, c = 0, r = 0)
+  ubound <- c(c0 = 85, c = 85, r = 50000)
+  optPars <- DEoptim(
+    fn = neglogLikelihood,
+    lower = lbound,
+    upper = ubound,
+    control = DEoptim.control(strategy =2, bs=F, NP=30, itermax=10, CR=0.5, F=0.8, trace=T)
+  )
+  
+  # store results
+  result<-optPars$optim$bestmem
+  c0 <- result[1]
+  c <- result[2]
+  r <- result[3]
+  
+  z_var_fit <- vgm(c,"Sph",r,c0)
+  #cvm <- as(vgm,"CovariogramStructure")
+  #C <- as(cvm, "function")(D)
+  
+  C <- variogramLine(z_var_fit,
+                     dist_vector=D,covariance=T)
+  
+  
+  diag(C) <- diag(C) + V
+  
+  
+  # compute GLS coefficients
+  C_inv <- chol2inv(chol(C))
+  XC <- crossprod(X,C_inv)
+  XCX <- XC%*%X
+  XCX_inv <- chol2inv(chol(XCX))
+  y <- train[,Z]
+  Cy <- crossprod(y, C_inv)
+  XCy<-crossprod(X,t(Cy))
+  beta_GLS<-XCX_inv%*%XCy
+  
+  
+  residuals<-y-X%*%beta_GLS
+  
+  pred <- matrix(0,nrow=nrow(test),ncol=1)
+  predvar <- matrix(0,nrow=nrow(test),ncol=1)
+  
+  for (i in 1:nrow(test)) {
+    h0<-sqrt((train$x-test$x[i])^2+(train$y-test$y[i])^2)
+    c0df<-variogramLine(z_var_fit,
+                        dist_vector=h0,covariance=TRUE)
+    C0 <- c0df$gamma
+    x0 <- as.vector(c(1,as.matrix(test[i,Xnames])))
+    muhat <- x0 %*%(beta_GLS)
+    CC0 <- solve(C,C0)
+    pred[i,]<- as.numeric(muhat+crossprod(CC0,as.vector(residuals)))
+    a <- x0 - crossprod(X,CC0)
+    predvar[i,] <- as.numeric(c0+c-crossprod(C0,CC0)
+                              +crossprod(a,solve(XCX,a)))
+  }
+  
+  list(pred=pred,predvar=predvar)
+  
+}
+
+
+val_stats_chloe <- function(obs,pred,error_variance){
+  #obs is a vector of the observed values
+  #pred is a matrix where the columns are the predictions of the models
+  e    <- pred-obs
+  ME   <- apply(e,2,mean)
+  MSE  <- apply(e,2,function(x){mean(x^2)-mean(error_variance)})
+  RMSE <- apply(e,2,function(x){sqrt(mean(x^2)-mean(error_variance))})
+  
+  MEC  <- apply(pred,2,function(x){(1 - (sum((x-obs)^2) / sum((obs-mean(obs))^2))) * 
+      (1+ ((mean(error_variance)/(1/length(x)*sum((obs-mean(obs))^2)+length(x)*mean(error_variance)))))})
+  
+  CCC <- apply(pred,2,function(x){(2*(((1/length(obs)*sum(obs*x))-(mean(obs)*(mean(x))))/
+                                         (var(obs)+var(x)+((mean(obs)-mean(x))^2)))) * 
+      ((var(obs)+var(x)+((mean(obs)-mean(x))^2))
+       / (var(obs)-mean(error_variance)+var(x)+((mean(obs)-mean(x))^2)))})
+  
+  
+  list(ME=ME,MSE=MSE,RMSE=RMSE,MEC=MEC,CCC=CCC)
+} 
+
+loglik_resvar <- function(resvar,e,V){
+  sum(log(resvar+V))+sum(e^2/(resvar+V))
+}
+
+EstimatePICP <-function(interval, observation){
+  q <- 0
+  for (i in 1:length(observation)){
+    if (observation[i] >= min(interval[i,])) {
+      if (observation[i] <= max(interval[i,])){
+        q <- q+1
+      }
+    }
+  }
+  q/length(observation)
+}
+
+################################################################
+#  (D)  Do for loop to perform model selection and assessment
+################################################################
+
+
+
+#######################################################
+#   (i) Split train/test sets & define folds in sets
+#######################################################
+
+#number of repeats for the evaluation
+B <- 100
+
+# 1 iteration took about 14 minutes to complete on my laptop
+
+#create matrices to store results
+
+mat_theta <- matrix(0,nrow=B,ncol=2,
+                    dimnames=list(1:B,c("RF","FRF")))
+mat_me <- matrix(0,nrow=B,ncol=2,
+                 dimnames=list(1:B,c("RF","FRF")))
+mat_mse <- matrix(0,nrow=B,ncol=2,
+                  dimnames=list(1:B,c("RF","FRF")))
+mat_rmse <- matrix(0,nrow=B,ncol=2,
+                   dimnames=list(1:B,c("RF","FRF")))
+mat_mec <- matrix(0,nrow=B,ncol=2,
+                   dimnames=list(1:B,c("RF","FRF")))
+mat_ccc <- matrix(0,nrow=B,ncol=2,
+                  dimnames=list(1:B,c("RF","FRF")))
+
+list_pred <- vector(mode="list",length=B)
+
+#seed <- 1243
+
+######
+#set k for cross validation for model selection
+k<-5
+
+#set the number of observations in each set
+nr_trn <- ceiling(0.7*nrow(d))
+nr_tst <- nrow(d) - nr_trn
+
+set.seed(123)
+
+loop_time <- Sys.time()
+
+for(l in 1:B){
+  
+  
+  #Split the sample into (70/10/20) train, validation and test sets
+  #Use the train and validation set to train models and for variable selection - model selection
+  #Use the test set for model assessment
+  
+  
+  #set.seed(seed)
+  train_ind <- sample(1:nrow(d),nr_trn)
+  train_ind <- train_ind[order(train_ind)]
+  trn <- d[train_ind,]
+  #set.seed(seed)
+  tst_ind <- sample(1:nrow(d[-train_ind,]),nr_tst)
+  tst_ind <- tst_ind[order(tst_ind)]
+  tst <- d[-train_ind,][tst_ind,]
+  
+  #create subset of V which will be used for training and model assessment
+  V_trn <- V[train_ind]
+  V_tst <- V[-train_ind]
+  
+  
+  #Created cv Indices for trn
+  #set.seed(seed)
+  trn <- trn[sample(1:nrow(trn)),]
+  trn$cv_inds <- cut(seq(1,nrow(trn)),breaks=k,labels=FALSE)
+  #re-order the data set 
+  trn <- trn[order(as.numeric(row.names(trn))),]
+  #set the folds column number
+  cv_nr <- ncol(trn)
+  
+  
+  
+  
+  ############################################################
+  #              (i) Perform CV for model selection (ms)
+  ############################################################
+  
+  ##########################################
+  #For RK (regression kriging)
+  #stepwise first for variable selection
+  ##########################################
+  
+  # #set max number of variables to be included in the model
+  # nvmax <- 40
+  # #set function
+  # fn <- as.formula(paste(Z,"~",paste(covs,collapse="+")))
+  # ms_lm <- matrix(NA,k,nvmax,dimnames=list(NULL,paste(1:nvmax)))
+  # 
+  # for(j in 1:k){
+  #   bestFit <- regsubsets(fn,data=trn[trn$cv_inds!=j,-cv_nr],
+  #                         nvmax=nvmax,method="seqrep")
+  #   for(i in 1:nvmax){
+  #     mm <- model.matrix(fn,data=trn[trn$cv_inds==j,-cv_nr])
+  #     coefs <- coef(bestFit,id=i)
+  #     pred <- mm[,names(coefs)]%*%coefs
+  #     ms_lm[j,i]=mean((trn[trn$cv_inds==j,Z]-pred)^2-V_trn[trn$cv_inds==j])
+  #   }
+  # }
+  # 
+  # ms_lm_m <- apply(ms_lm,2,mean)
+  # ms_lm_f <- which.min(ms_lm_m)
+  # 
+  # lm_trn <- regsubsets(fn,data=trn,nvmax=nvmax,method="seqrep")
+  
+  
+  
+  
+  ##########################################
+  # RF
+  ##########################################
+  
+  
+  ##########################
+  #      RF without ME
+  ##########################
+  
+  #set max number of variables to be included in the model
+  mtry <- 20
+  #set function
+  fn <- as.formula(paste(Z,"~",paste(covs,collapse="+")))
+  ms_rfNoME <- matrix(NA,k,mtry,dimnames=list(NULL,paste(1:mtry)))
+  
+  for(j in 1:k){
+    tr <- trn[trn$cv_inds!=j,]
+    te <- trn[trn$cv_inds==j,]
+    for(i in 1:mtry){
+      rf_fit <- ranger(formula=fn,data=tr,mtry=i)
+      rf_pred <- as.matrix(predict(rf_fit,te)$prediction)
+      ms_rfNoME[j,i]=mean((te[,Z]-rf_pred)^2-V_trn[trn$cv_inds==j])
+    }
+  }
+  ms_rfNoME_m <- apply(ms_rfNoME,2,mean)
+  ms_rfNoME_f <- which.min(ms_rfNoME_m)
+  
+  
+  ##########################
+  #      RF with ME
+  ##########################
+  
+  
+  ms_rfME <- matrix(NA,k,mtry,dimnames=list(NULL,paste(1:mtry)))
+  for(j in 1:k){
+    tr <- trn[trn$cv_inds!=j,]
+    te <- trn[trn$cv_inds==j,]
+    V_tr <- V_trn[trn$cv_inds!=j]
+    for(i in 1:mtry){
+      rf_fit <- ranger(formula=fn,data=tr,mtry=i)
+      resvar <- lm(abs(tr[,Z]-rf_fit$predictions)~rf_fit$predictions)$fitted.values^2
+      resvar_ML <- optim(par=resvar,fn=loglik_resvar,
+                         e=(tr[,Z]-rf_fit$predictions),V=V_tr)
+      resvar_est <- resvar_ML$par
+      wts <- 1/(resvar_est+V_tr)
+      rf_fit2 <- ranger(formula=fn,data=tr,mtry=i,case.weights=wts)
+      rf_pred <- as.matrix(predict(rf_fit2,te)$prediction)
+      ms_rfME[j,i]=mean((te[,Z]-rf_pred)^2-V_trn[trn$cv_inds==j])
+    }
+  }
+  ms_rfME_m <- apply(ms_rfME,2,mean)
+  ms_rfME_f <- which.min(ms_rfME_m)
+  
+  
+  ############################################################
+  #              (ii) Perform model assessment
+  ############################################################
+  
+  ##############
+  #  kriging
+  ##############
+  
+  
+  # Xnames_lm <- names(coef(lm_trn,ms_lm_f)[-1])
+  # 
+  # 
+  # ma_RK_pred <- RK(train=trn,test=tst,Xnames=Xnames_lm)$pred
+  # ma_FRK_pred <- FRK(train=trn,test=tst,Xnames=Xnames_lm,V=V_trn)$pred
+  # 
+  # ma_RK <- val_stats_chloe(tst$clay,cbind(ma_RK_pred,ma_FRK_pred),V_tst)
+  # #insert your PIPC function here
+  
+  
+  ##############
+  #  RF
+  ##############
+  
+  #without ME
+  ma_rfnoME_fit  <- ranger(formula=fn,data=trn,mtry=ms_rfNoME_f)
+  ma_rfnoME_pred <- as.matrix(predict(ma_rfnoME_fit,tst)$prediction)
+  #with ME
+  ma_rfME_fit  <- ranger(formula=fn,data=trn,mtry=ms_rfME_f)
+  resvar <- lm(abs(trn[,Z]-ma_rfME_fit$predictions)~ma_rfME_fit$predictions)$fitted.values^2
+  resvar_ML <- optim(par=resvar,fn=loglik_resvar,
+                     e=(trn[,Z]-ma_rfME_fit$predictions),V=V_trn)
+  resvar_est <- resvar_ML$par
+  wts <- 1/(resvar_est+V_trn)
+  ma_rfME_fit2  <- ranger(formula=fn,data=trn,mtry=ms_rfME_f,case.weights=wts)
+  ma_rfME_pred <- as.matrix(predict(ma_rfME_fit2,tst)$prediction)
+  
+  ma_RF <- val_stats_chloe(tst$clay,cbind(ma_rfnoME_pred,ma_rfME_pred),V_tst)
+  #insert your PIPC function here
+  
+  
+  
+  mat_theta[l,] <- c(ms_rfNoME_f,ms_rfME_f)
+  
+  mat_me[l,] <- c(ma_RF$ME[1],ma_RF$ME[2])
+  
+  mat_mse[l,] <- c(ma_RF$MSE[1],ma_RF$MSE[2])
+  
+  mat_rmse[l,] <- c(ma_RF$RMSE[1],ma_RF$RMSE[2])
+  
+  mat_mec[l,] <- c(ma_RF$MEC[1],ma_RF$MEC[2])
+  
+  mat_ccc[l,] <- c(ma_RF$CCC[1],ma_RF$CCC[2])
+  
+  list_pred[[l]] <- cbind( ma_rfnoME_pred,ma_rfME_pred)
+  
+}
+
+loop_time <- Sys.time() - loop_time
+
+
+#compile results
+
+rslt_theta <- apply(mat_theta,2,summary)
+
+ME <- apply(mat_me,2,mean)
+MSE <- apply(mat_mse,2,mean)
+RMSE <- apply(mat_rmse,2,mean)
+MEC <- apply(mat_mec,2,mean)
+CCC <- apply(mat_ccc,2,mean)
+
+add <- function(x) Reduce("+", x)
+list_pred_means <- data.frame(add(list_pred)/B)
+colnames(list_pred_means) <- c("RF","FRF")
+list_pred_means$clay <- tst$clay
+
+#list_pred_means is a data frame with the mean of all the predictions
+
+#run table in latex, and copy-and-paste to overleaf
+xtable(round(rbind(ME,MSE,RMSE,MEC,CCC),2))
+
+#find optimal parameters from results
+results_rmse <- cbind(mat_theta,mat_rmse)
+
+######
+#  LM    
+######
+
+# 
+# theta_lm_rmse <- rollup(results_rmse[,c("LM","RK","FRK")],1,results_rmse[,"LM"],mean)
+# names(which.min(theta_lm_rmse[,1]))
+# names(which.min(theta_lm_rmse[,2]))
+# names(which.min(theta_lm_rmse[,3]))
+# 
+# #final parameter for kriging
+# ms_lm_f <- as.numeric(names(which.min(theta_lm_rmse[,2])))
+
+
+#######
+#  RF    
+#######
+
+theta_rf_rmse <- rollup(results_rmse[,c(1,3)],1,results_rmse[,1],mean)
+plot(x=theta_rf_rmse[,1],y=theta_rf_rmse[,2],type="b",xlab="theta",ylab="rmse")
+names(which.min(theta_rf_rmse[,2]))
+
+#final parameter for RF
+ms_rfNoME_f <- as.numeric(names(which.min(theta_rf_rmse[,1])))
+
+
+#######
+#  FRF    
+#######
+
+
+theta_frf_rmse <- rollup(results_rmse[,c(2,4)],1,results_rmse[,2],mean)
+plot(x=theta_frf_rmse[,1],y=theta_frf_rmse[,2],type="b",xlab="theta",ylab="rmse")
+names(which.min(theta_frf_rmse[,2]))
+
+#final parameter for FPPR
+ms_rfME_f <- as.numeric(names(which.min(theta_frf_rmse[,2])))
+
+#######################################################################
+#        Traditional cross-validation (if needed)
+#######################################################################
+
+k <- 5
+cv_data <- d
+
+C <- 100
+
+
+cv_results_RF <- matrix(0, nrow=C, ncol=5)
+cv_results_FRF <- matrix(0, nrow=C, ncol=5)
+cv_PICP_RF <- rep(0,C)
+cv_PICP_FRF <- rep(0,C)
+
+for (l in 1:C){
+# Split training dataset into k folds
+folds <- rep(1:k, ceiling(nrow(cv_data)/k))
+folds <- sample(folds, length(folds))
+folds <- folds[1:nrow(cv_data)]
+
+cv_data$fold <- folds
+
+ma_cv_RF <- matrix(0, nrow=k, ncol=5)
+ma_cv_FRF <- matrix(0, nrow=k, ncol=5)
+
+PICP_adjusted_RF <- rep(0, k)
+PICP_adjusted_FRF <- rep(0, k)
+
+for (i in 1:k){
+  training_cv <- cv_data[cv_data$fold != i,]
+  test_cv <- cv_data[cv_data$fold == i,]
+  
+  # RF
+  rf_fit_cv <- ranger(formula=fn,training_cv,mtry=ms_rfNoME_f)
+  rf_pred_cv <- predict(rf_fit_cv, test_cv)$prediction
+  rf_pred_cv <- as.matrix(rf_pred_cv, ncol=1)
+  
+  rf_fit_cv <-  quantregRanger(formula=fn,training_cv,params.ranger=list(mtry=ms_rfNoME_f))
+  
+  ma_RF_cv <- val_stats_chloe(test_cv$clay,rf_pred_cv,test_cv$clay_sd^2)
+  ma_cv_RF[i,] <- c(ma_RF_cv$ME, ma_RF_cv$MSE, ma_RF_cv$RMSE, ma_RF_cv$MEC, ma_RF_cv$CCC)
+  
+  # FRF
+  frf_fit_cv <- ranger(formula=fn,training_cv,mtry=ms_rfME_f)
+  
+  resvar <- lm(abs(training_cv$clay-frf_fit_cv$predictions)~frf_fit_cv$predictions)$fitted.values^2
+  resvar_ML <- optim(par=resvar,fn=loglik_resvar,
+                     e=(training_cv$clay-frf_fit_cv$predictions),V=training_cv$clay_sd^2)
+  resvar_est <- resvar_ML$par
+  wts <- 1/(resvar_est+(training_cv$clay_sd^2))
+  frf_fit_cv <- ranger(formula=fn,training_cv,case.weights=wts,mtry=ms_rfME_f)
+  frf_pred_cv <- predict(frf_fit_cv, test_cv)$prediction
+  frf_pred_cv <- as.matrix(frf_pred_cv, ncol=1)
+  frf_fit_cv <- quantregRanger(formula=fn,training_cv,params.ranger=list(case.weights=wts,mtry=ms_rfME_f))
+  
+  ma_FRF_cv <- val_stats_chloe(test_cv$clay,frf_pred_cv,test_cv$clay_sd^2)
+  ma_cv_FRF[i,] <- c(ma_FRF_cv$ME, ma_FRF_cv$MSE, ma_FRF_cv$RMSE, ma_FRF_cv$MEC, ma_FRF_cv$CCC)
+  
+  #PICP
+  pred_interval_RF <- predict(rf_fit_cv,test_cv, quantiles= c(0.05,0.95))
+  pred_interval_FRF <- predict(frf_fit_cv, test_cv,quantiles= c(0.05,0.95))
+  error_sd_rf <- rep(0,nrow(test_cv))
+  error_sd_frf <- rep(0,nrow(test_cv))
+  for (j in 1:nrow(test_cv)) {
+    error_sd_rf[j] <- (max(pred_interval_RF[j,])-min(pred_interval_RF[j,]))/(2*1.645)
+    error_sd_frf[j] <- (max(pred_interval_FRF[j,])-min(pred_interval_FRF[j,]))/(2*1.645)
+  }
+  mini_rf <- rf_pred_cv - 1.645*sqrt(error_sd_rf^2 + test_cv$clay_sd^2)
+  maxi_rf <- rf_pred_cv + 1.645*sqrt(error_sd_rf^2 + test_cv$clay_sd^2)
+  adjusted_interval_rf <- data.frame(mini_rf, maxi_rf)
+  PICP_adjusted_RF[i] <- EstimatePICP(adjusted_interval_rf, test_cv$clay)
+  
+  mini_frf <- frf_pred_cv - 1.645*sqrt(error_sd_frf^2 + test_cv$clay_sd^2)
+  maxi_frf <- frf_pred_cv + 1.645*sqrt(error_sd_frf^2 + test_cv$clay_sd^2)
+  adjusted_interval_frf <- data.frame(mini_frf, maxi_frf)
+  PICP_adjusted_FRF[i] <- EstimatePICP(adjusted_interval_frf, test_cv$clay)
+  }
+cv_PICP_RF[l] <- mean(PICP_adjusted_RF)
+cv_PICP_FRF[l] <- mean(PICP_adjusted_FRF)
+
+cv_results_RF[l,] <- c(mean(ma_cv_RF[,1]),mean(ma_cv_RF[,2]),mean(ma_cv_RF[,3]),mean(ma_cv_RF[,4]),mean(ma_cv_RF[,5]))
+
+cv_results_FRF[l,] <- c(mean(ma_cv_FRF[,1]),mean(ma_cv_FRF[,2]),mean(ma_cv_FRF[,3]),mean(ma_cv_FRF[,4]),mean(ma_cv_FRF[,5]))
+}
+
+
+cv_RF <- c(mean(cv_results_RF[,1]),mean(cv_results_RF[,2]),mean(cv_results_RF[,3]),mean(cv_results_RF[,4]),mean(cv_results_RF[,5]),mean(cv_PICP_RF))
+names(cv_RF) <- c("ME", "MSE", "RMSE", "MEC", "CCC", "PICP")
+cv_FRF <- c(mean(cv_results_FRF[,1]),mean(cv_results_FRF[,2]),mean(cv_results_FRF[,3]),mean(cv_results_FRF[,4]),mean(cv_results_FRF[,5]), mean(cv_PICP_FRF))
+names(cv_FRF) <- c("ME", "MSE", "RMSE", "MEC", "CCC", "PICP")
+
+#######################################################################
+#        (F) Fit models on full sample and predict the Nam grid
+#######################################################################
+
+#Transform the grid to a data.frame
+grid_covs <- as_Spatial(grid_covs)
+grdcovs <- as.data.frame(grid_covs)
+
+grdcovs$x <- coordinates(grid_covs)[,1]
+grdcovs$y <- coordinates(grid_covs)[,2]
+
+# 
+# lm_full <- regsubsets(fn,data=d,nvmax=40,method="seqrep")
+# Xnames_full <- names(coef(lm_full,ms_lm_f)[-1])
+# 
+# #fit kriging models
+# 
+# krig_time <- Sys.time()
+# RK_pred <- FRK(train=d,test=grdcovs,Xnames=Xnames_full,V=rep(0.001,length(V)))$pred
+# krig_time <- Sys.time() - krig_time
+# 
+# FRK_pred <- FRK(train=d,test=grdcovs,Xnames=Xnames_full,V=V)$pred
+
+
+#fit random forests
+rf_fit <- ranger(formula=fn,data=d,mtry=ms_rfNoME_f, importance='impurity')
+rf_pred <- as.matrix(predict(rf_fit,grdcovs)$prediction)
+
+rf_fit_nowts <- ranger(formula=fn,data=d,mtry=ms_rfME_f)
+resvar <- lm(abs(d[,Z]-rf_fit_nowts$predictions)~rf_fit_nowts$predictions)$fitted.values^2
+resvar_ML <- optim(par=resvar,fn=loglik_resvar,
+                   e=(d[,Z]-rf_fit_nowts$predictions),V=V)
+resvar_est <- resvar_ML$par
+wts_rf <- 1/(resvar_est+V)
+rf_fit2 <- ranger(formula=fn,data=d,case.weights=wts_rf,mtry=ms_rfME_f, importance='impurity')
+rf_pred2 <- as.matrix(predict(rf_fit2,grdcovs)$prediction)
+
+
+# Compute prediction intervals
+
+rf_fit_90 <- quantregRanger(formula=fn,d,params.ranger=list(mtry=ms_rfNoME_f))
+rf_pred_90 <- as.matrix(predict(rf_fit_90,grdcovs, type="quantiles", quantiles= c(0.05,0.95)))
+
+rf_fit2_90 <- quantregRanger(formula=fn,d,params.ranger=list(case.weights=wts_rf,mtry=ms_rfME_f))
+rf_pred2_90 <- as.matrix(predict(rf_fit2_90,grdcovs, type="quantiles", quantiles= c(0.05,0.95)))
+
+
+#quickly view distributions for each model's predictions
+apply(cbind(rf_pred,rf_pred2),2,summary)
+summary(d$clay)
+
+clay_lmts <- function(x){x<-ifelse(x<0,0,x);x<-ifelse(x>100,100,x);return(x)}
+
+apply(cbind(clay_lmts(rf_pred),clay_lmts(rf_pred2)),2,summary)
+
+
+
+
+#create data.frames for predictions
+
+results_rf <- data.frame(x=grdcovs$x,y=grdcovs$y,clay=clay_lmts(rf_pred)) 
+results_rf2 <- data.frame(x=grdcovs$x,y=grdcovs$y,clay=clay_lmts(rf_pred2))
+
+results_rf_90 <- data.frame(x=grdcovs$x,y=grdcovs$y,clay=clay_lmts(rf_pred_90)) 
+results_rf2_90 <- data.frame(x=grdcovs$x,y=grdcovs$y,clay=clay_lmts(rf_pred2_90))
+
+
+# Get stats on the results
+summary(results_rf$clay)
+summary(results_rf2$clay)
+
+summary(results_rf_90)
+summary(results_rf2_90)
+
+
+
+#######################################################################
+#        (G) Create figures
+#######################################################################
+
+data("World")
+
+#set graphics resolution
+res <- 300
+
+
+#Nam_locs = locations of samples in Namibia
+
+jpeg(paste0(getwd(),"/Figures/Nam_locs.jpeg"), width=750/96*res, height=600/96*res, res=res)
+
+tm_shape(country) + tm_polygons(col="white",border.col="black", lwd=2) + tm_shape(World) + tm_polygons("gray", border.col = "gray") + tm_shape(country) + tm_polygons(col="white",border.col="black", lwd=2) +
+  tm_shape(s_d[s_d$source=="afsp",]) + 
+  tm_symbols(col="blue",border.col="black",size=1) +
+  tm_shape(s_d[s_d$source=="LPKS"&!is.na(s_d$clay_sd),]) + 
+  tm_symbols(col="red",border.col="black",size=1) +
+  tm_add_legend(title="Source",type="symbol",labels=c("AfSP","LandPKS"),
+                col=c("blue","red"),border.col="black",size=1) +
+  tm_compass(position=c("right","bottom"),size=2) +
+  tm_scale_bar(position=c("right","bottom"),text.size=1) +
+  tm_layout(frame=TRUE,legend.position=c("right","center"),legend.frame=F,legend.text.size=1,bg.color="sky blue")
+
+dev.off()
+
+
+tm_shape(country) + tm_polygons(col="white",border.col="black") + 
+  tm_shape(s_d[s_d$clay>=50,]) + 
+  tm_symbols(col="blue",border.col="black",size=1) 
+
+
+
+#map to view spatial heterogeneity of clay observations
+
+
+myPal <- RColorBrewer::brewer.pal(5,"YlGn")
+
+jpeg(paste0(getwd(),"/Figures/Nam_clay.jpeg"), width=750/96*res, height=600/96*res, res=res)
+tm_shape(country) + tm_polygons(col="white",border.col="black") + tm_shape(World) + tm_polygons("gray", border.col = "gray") + tm_shape(country) + tm_polygons(col="white",border.col="black", lwd=2) +
+  tm_shape(s_d[!is.na(s_d$clay_sd),]) + 
+  tm_symbols(col="clay",border.col="black",size=0.5,shape=21,midpoint=50,
+             breaks=c(0,12,24,36,48,60),n=5,palette="YlGn",legend.col.show=F) +
+  tm_add_legend(type="symbol",title="Topsoil clay content (in %)",
+                col=myPal,labels=c("0-12","12-24","24-36","36-48","48-60"),
+                border.col="black") +
+  tm_compass(position=c("right","bottom"),size=2) +
+  tm_scale_bar(position=c("right","bottom"),text.size=1) +
+  tm_layout(frame=TRUE,legend.position=c("right","center"),legend.frame=F,legend.text.size=1,bg.color="sky blue")
+
+
+dev.off()
+
+#Nam_locs_clay = locations of samples in Namibia combined with clay content
+
+jpeg(paste0(getwd(),"/Figures/Nam_locs_clay.jpeg"), width=750/96*res, height=600/96*res, res=res)
+
+tm_shape(country) + tm_polygons(col="white",border.col="black") + 
+  tm_shape(World) + tm_polygons("gray", border.col = "gray") + tm_shape(country) + tm_polygons(col="white",border.col="black", lwd=2) +
+  tm_shape(s_d[s_d$source=="afsp",]) + 
+  tm_symbols(col="clay",border.col="black",size=0.5, shape=24,                      # Shape 24 (triangle) looked larger than the circles, so I reduced their size (unfortunately, this does not affect the size on the legend)
+             breaks=c(0,12,24,36,48,60),n=5,palette="YlGn",legend.col.show=F) +
+  tm_shape(s_d[s_d$source=="LPKS"&!is.na(s_d$clay_sd),]) + 
+  tm_symbols(col="clay",border.col="black",size=0.7, shape=21,
+             breaks=c(0,12,24,36,48,60),n=5,palette="YlGn",legend.col.show=F) +
+  tm_add_legend(title="Source",type="symbol",labels=c("AfSP","LandPKS"),
+                shape=c(24,21),col="white",border.col="black",size=1) +
+  tm_add_legend(type="symbol",title="Topsoil clay content (in %)",
+                col=myPal,labels=c("0-12","12-24","24-36","36-48","48-60"),
+                border.col="black") +
+  tm_compass(position=c("right","bottom"),size=2) +
+  tm_scale_bar(position=c("right","bottom"),text.size=1) +
+  tm_layout(frame=TRUE,legend.position=c("right","center"),legend.frame=F,legend.text.size=1,bg.color="sky blue")
+
+dev.off()
+
+#Nam_locs_unc = locations of samples in Namibia combined with clay content
+
+myPal <- RColorBrewer::brewer.pal(4,"YlOrBr")
+
+jpeg(paste0(getwd(),"/Figures/Nam_locs_unc.jpeg"), width=750/96*res, height=600/96*res, res=res)
+
+tm_shape(country) + tm_polygons(col="white",border.col="black") +
+  tm_shape(World) + tm_polygons("gray", border.col = "gray") + tm_shape(country) + tm_polygons(col="white",border.col="black", lwd=2) +
+  tm_shape(s_d[s_d$source=="afsp",]) + 
+  tm_symbols(col="clay_sd",border.col="black",size=0.5,shape=24,
+             breaks=c(0,2,4,6,8),n=4,palette="YlOrBr",legend.col.show=F) +
+  tm_shape(s_d[s_d$source=="LPKS"&!is.na(s_d$clay_sd),]) + 
+  tm_symbols(col="clay_sd",border.col="black",size=0.7,shape=21,
+             breaks=c(0,2,4,6,8),n=4,palette="YlOrBr",legend.col.show=F) +
+  tm_add_legend(title="Source",type="symbol",col="white",labels=c("AfSP","LandPKS"),
+                shape=c(24,21),border.col="black",size=1) +
+  tm_add_legend("symbol",title="Measurement uncertainty \n(in % clay)"
+                ,col=myPal,labels=c("0-2","2-4","4-6","6-8")) +
+  tm_compass(position=c("right","bottom"),size=2) +
+  tm_scale_bar(position=c("right","bottom"),text.size=1) +
+  tm_layout(frame=TRUE,legend.position=c("right","center"),legend.frame=F,legend.text.size=1,bg.color="sky blue")
+
+dev.off()
+
+#create map of Namibia to visualise ME uncertainty (the heterogeneity of it)
+
+jpeg(paste0(getwd(),"/Figures/Nam_unc.jpeg"), width=750/96*res, height=600/96*res, res=res)
+
+myPal <- RColorBrewer::brewer.pal(4,"YlOrBr")
+tm_shape(country) + tm_polygons(col="white",border.col="black") + 
+  tm_shape(World) + tm_polygons("gray", border.col = "gray") + tm_shape(country) + tm_polygons(col="white",border.col="black", lwd=2) +
+  tm_shape(s_d) + 
+  tm_symbols(col="clay_sd",border.col="black",size=0.5,shape=21,
+             breaks=c(0,2,4,6,8),n=4,palette="YlOrBr",legend.col.show=F) +
+  tm_add_legend("symbol",title="Measurement uncertainty \n(in % clay)",col=myPal,labels=c("0-2","2-4","4-6","6-8")) +
+  tm_compass(position=c("right","bottom"),size=2) +
+  tm_scale_bar(position=c("right","bottom"),text.size=1) +
+  tm_layout(frame=TRUE,legend.position=c("right","center"),legend.frame=F,legend.text.size=1,bg.color="sky blue")
+
+dev.off()
+
+
+
+
+#create prediction maps
+
+
+RF_rstr <- rasterFromXYZ(results_rf)
+proj4string(RF_rstr) <- aeqd
+names(RF_rstr) <- "RF"
+
+FRF_rstr <- rasterFromXYZ(results_rf2)
+proj4string(FRF_rstr) <- aeqd
+names(FRF_rstr) <- "FRF"
+
+rstrs <- stack(RF_rstr,FRF_rstr)
+
+# Prediction interval RF: min, max, diff
+RF_rstr_min <- rasterFromXYZ(results_rf_90[,-4])
+proj4string(RF_rstr_min) <- aeqd
+names(RF_rstr_min) <- "RF min"
+
+RF_rstr_max <- rasterFromXYZ(results_rf_90[,-3])
+proj4string(RF_rstr_max) <- aeqd
+names(RF_rstr_min) <- "RF max"
+
+RF_rstr_range <- stack(RF_rstr_max-RF_rstr_min)
+names(RF_rstr_range) <- "RF prediction interval"
+
+# Prediction interval FRF: min, max, diff
+FRF_rstr_min <- rasterFromXYZ(results_rf2_90[,-4])
+proj4string(FRF_rstr_min) <- aeqd
+names(FRF_rstr_min) <- "FRF min"
+
+FRF_rstr_max <- rasterFromXYZ(results_rf2_90[,-3])
+proj4string(FRF_rstr_max) <- aeqd
+names(RF_rstr_min) <- "FRF max"
+
+FRF_rstr_range <- stack(FRF_rstr_max-FRF_rstr_min)
+names(FRF_rstr_range) <- "FRF prediction interval"
+
+rstrs_int <- stack(RF_rstr_range,FRF_rstr_range)
+
+rstrs_difs_int <- stack(RF_rstr_range-FRF_rstr_range)
+
+# Computing the average width of the prediction interval
+mean(na.omit(getValues(RF_rstr_range)))
+mean(na.omit(getValues(FRF_rstr_range)))
+
+
+rstrs_difs <- stack(RF_rstr-FRF_rstr)
+
+names(rstrs_difs) <- c("FRF")
+
+
+#myPal <- RColorBrewer::brewer.pal(9,"YlOrBr")
+
+myPal <- RColorBrewer::brewer.pal(5,"YlGn")
+
+
+jpeg(paste0(getwd(),"/Figures/Nam_preds.jpeg"), width=750/96*res, height=600/96*res, res=res)
+
+tm_shape(country) + tm_polygons(col="white",border.col="black", lwd=2) + tm_shape(World) + tm_polygons("gray", border.col = "gray") + 
+tm_shape(rstrs,is.master =T) + 
+  tm_raster(title = 'Topsoil clay content (in %)',
+            legend.is.portrait = FALSE, 
+            legend.format = list(text.align='center'),
+            style="cont", n = 5,midpoint = 50,
+            palette=myPal) + 
+  tm_compass(position=c("right","bottom"),size=2) +
+  tm_scale_bar(position=c("right","bottom"),text.size=0.8) +
+  tm_layout(frame=TRUE,                                # frame creates a frame around the maps
+            outer.margins=c(0.01,.02,0.01,.02),
+            inner.margins=c(0.03,0.03,0.03,0.03),      # this is the space between the map and the frame
+            legend.title.size = 1,
+            legend.text.size = 0.8,
+            # legend.outside = TRUE,
+            legend.outside.position = 'bottom',
+            legend.outside.size = .16,
+            legend.just = c('center','top'),
+            legend.position = c('center','TOP'),
+            panel.show=FALSE,                          # when panel.show is TRUE, the frame creates a cartouche above each map for the title
+            panel.labels =  paste(c("",""),""),
+            frame.lwd = 2, panel.label.bg.color = NA,  # when setting frame=TRUE, frame.lwd (line width) needs a value
+            attr.outside=TRUE,bg.color="sky blue") +
+  tm_facets(nrow=1,as.layers=T,free.scales.raster=F) 
+
+dev.off()
+
+#use outer margins in tm_layout
+
+
+jpeg(paste0(getwd(),"/Figures/Nam_pred_intervals.jpeg"), width=750/96*res, height=600/96*res, res=res)
+
+tm_shape(country) + tm_polygons(col="white",border.col="black", lwd=2) + tm_shape(World) + tm_polygons("gray", border.col = "gray") + 
+tm_shape(rstrs_int,is.master =T) + 
+  tm_raster(title = 'Interval width (in % clay)',
+            legend.is.portrait = FALSE, 
+            legend.format = list(text.align='center'),
+            style="cont", n = 5,midpoint = 50,
+            palette=myPal) + 
+  tm_compass(position=c("right","bottom"),size=2) +
+  tm_scale_bar(position=c("right","bottom"),text.size=0.8) +
+  tm_layout(frame=TRUE,
+            outer.margins=c(0.01,.02,0.01,.02),
+            inner.margins=c(0.03,0.03,0.03,0.03),
+            legend.title.size = 1,
+            legend.text.size = 0.8,
+            legend.outside = TRUE,
+            legend.outside.position = 'bottom',
+            legend.outside.size = .16,
+            legend.just = c('center','top'),
+            legend.position = c('center','TOP'),
+            panel.show=FALSE,
+            panel.labels =  paste(c("",""),""),
+            frame.lwd = 2, panel.label.bg.color = NA,
+            attr.outside=TRUE,bg.color="sky blue") +
+  tm_facets(nrow=1,as.layers=T,free.scales.raster=F) 
+
+dev.off()
+
+
+
+#plot differences and scatter plots
+
+
+
+jpeg(paste0(getwd(),"/Figures/Nam_difs.jpeg"), width=750/96*res, height=600/96*res, res=res)
+
+myPal <- RColorBrewer::brewer.pal(5,"RdBu")           # Original palette: "YlOrBr"
+
+tm_shape(country) + tm_polygons(col="white",border.col="black", lwd=2) + tm_shape(World) + tm_polygons("gray", border.col = "gray") + 
+tm_shape(rstrs_difs,is.master = T) + 
+  tm_raster(title = 'Prediction difference (in % clay)',
+            legend.is.portrait = FALSE, 
+            legend.format = list(text.align='center'),
+            style="cont", n = 5,midpoint = 0,
+            palette=myPal) + 
+  tm_layout(frame=TRUE,
+            inner.margins=c(0.03,0.03,0.03,0.03),
+            legend.title.size = 1,
+            legend.text.size = 0.8,
+            legend.outside = TRUE,
+            legend.outside.position = 'bottom',
+            legend.outside.size = .16,
+            legend.just = c('center','top'),
+            legend.position = c('center','TOP'),
+            panel.show=FALSE,
+            panel.labels =  "",
+            frame.lwd = 2, panel.label.bg.color = NA,bg.color="sky blue") +
+  tm_facets(nrow=1,as.layers=T,free.scales.raster=F) +
+  tm_compass(position=c("right","bottom"),size=2) +
+  tm_scale_bar(position=c("right","bottom"),text.size=0.8)
+
+dev.off()
+
+
+jpeg(paste0(getwd(),"/Figures/Nam_difs_pred_int.jpeg"), width=750/96*res, height=600/96*res, res=res)
+
+myPal <- RColorBrewer::brewer.pal(5,"RdBu")           # Original palette: "YlOrBr"
+
+tm_shape(country) + tm_polygons(col="white",border.col="black", lwd=2) + tm_shape(World) + tm_polygons("gray", border.col = "gray") + 
+tm_shape(rstrs_difs_int,is.master = T) + 
+  tm_raster(title = 'Interval difference (in % clay)',
+            legend.is.portrait = FALSE, 
+            legend.format = list(text.align='center'),
+            style="cont", n = 5,midpoint = 0,
+            palette=myPal) + 
+  tm_compass(position=c("right","bottom"),size=2) +
+  tm_scale_bar(position=c("right","bottom"),text.size=0.8) +
+  tm_layout(frame=TRUE,
+            inner.margins=c(0.03,0.03,0.03,0.03),
+            legend.title.size = 1,
+            legend.text.size = 0.8,
+            legend.outside = TRUE,
+            legend.outside.position = 'bottom',
+            legend.outside.size = .16,
+            legend.just = c('center','top'),
+            legend.position = c('center','TOP'),
+            panel.show=FALSE,
+            panel.labels =  "",
+            frame.lwd = 2, panel.label.bg.color = NA,bg.color="sky blue") +
+  tm_facets(nrow=1,as.layers=T,free.scales.raster=F) 
+
+dev.off()
+
+
+plot(y=list_pred_means$RK,x=list_pred_means$clay,
+     ylim=c(0,60),xlim=c(0,60),ylab="RK",xlab="Observed clay content")
+plot(y=list_pred_means$FRK,x=list_pred_means$clay,
+     ylim=c(0,60),xlim=c(0,60),ylab="FRK",xlab="Observed clay content")
+plot(y=list_pred_means$HFRK,x=list_pred_means$clay,
+     ylim=c(0,60),xlim=c(0,60),ylab="HFRK",xlab="Observed clay content")
+plot(y=list_pred_means$PPR,x=list_pred_means$clay,
+     ylim=c(0,60),xlim=c(0,60),ylab="PPR",xlab="Observed clay content")
+plot(y=list_pred_means$FPPR,x=list_pred_means$clay,
+     ylim=c(0,60),xlim=c(0,60),ylab="FPPR",xlab="Observed clay content")
+plot(y=list_pred_means$RF,x=list_pred_means$clay,
+     ylim=c(0,60),xlim=c(0,60),ylab="RF",xlab="Observed clay content")
+plot(y=list_pred_means$FRF,x=list_pred_means$clay,
+     ylim=c(0,60),xlim=c(0,60),ylab="FRF",xlab="Observed clay content")
+
+
+# Plots for Case Study section
+par(mfrow=c(1,2))
+hist(d$clay, col="light blue", main="", xlab="Topsoil clay content (in %)", ylab="Observations", ylim=c(0,120))
+hist(d$clay_sd, col="light blue", main="", xlab="Measurement standard deviation (in % clay)", ylab="Observations", ylim=c(0,120))
+
+palette(c("blue","red"))
+plot(d$clay_sd~d$clay, col=d$source,
+     xlab="Topsoil clay content (in %)", ylab="Measurement error standard deviation (in % clay)", pch=19)
+legend("bottomright",legend=unique(d$source), pch=19, col=(c("blue","red")))
+
+
+# Investigate variable importance
+
+var_imp <- importance(rf_fit)
+sort(var_imp, decreasing=TRUE)
+
+var_imp2 <- importance(rf_fit2)
+sort(var_imp2, decreasing=TRUE)
+
+par(mfrow=c(1,2))
+
+barplot(sort(var_imp, decreasing=TRUE), ylim=c(0,860), ylab="covariate importance", names.arg="")
+barplot(sort(var_imp2, decreasing=TRUE), ylim=c(0,860), ylab="covariate importance", names.arg="")
+
+main_cov_RF <- names(tail(sort(var_imp), 10))
+main_cov_FRF <- names(tail(sort(var_imp2), 10))
+
+cor(d[,main_cov_RF], d[,main_cov_FRF])
+
+# Investigate intervals
+
+RF_range <- results_rf_90[,-3] - results_rf_90[,-4]
+summary(RF_range)
+FRF_range <- results_rf2_90[,-3] - results_rf2_90[,-4]
+summary(FRF_range)
+RF_FRF_range <- RF_range[,3] - FRF_range[,3]
+summary(RF_FRF_range)
+
+
+#######################################################################
+
+#                           END OF SCRIPT
+
+#######################################################################
