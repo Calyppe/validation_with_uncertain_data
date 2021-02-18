@@ -214,6 +214,6 @@ results_100$MSE <- results_100$RMSE^2
 
 boxplot(MSE~data_used*model*err_amplified, data=results_100,
         col=c("gold","orange"), names=c("FRF\n0%","RF\n0%","FRF\n25%","RF\n25%","FRF\n50%","RF\n50%","FRF\n75%","RF\n75%","FRF\n100%","RF\n100%"),
-        xlab="Proportion of uncertainty-enhanced data", ylab="MSE")
+        xlab="Proportion of uncertainty-enhanced data", ylab="MSE (%)²")
 
 # ---END---#
